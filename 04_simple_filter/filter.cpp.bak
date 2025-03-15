@@ -8,13 +8,10 @@ extern "C" {
 #include <libavfilter/buffersrc.h>
 #include <libavdevice/avdevice.h>
 #include <libavutil/pixdesc.h>
-#include <libswscale/swscale.h>
 }
 #include "something.h"
 #include "defer.h"
 #include "fmt/format.h"
-#include "ffmpegcv.hpp"
-
 
 int main(int argc, char* argv[])
 {
@@ -112,30 +109,61 @@ int main(int argc, char* argv[])
     //
     // output
     //
+    AVFormatContext * encoder_fmt_ctx = nullptr;
+    CHECK(avformat_alloc_output_context2(&encoder_fmt_ctx, nullptr, nullptr, out_filename) >= 0);
+    defer(avformat_free_context(encoder_fmt_ctx));
+
+    CHECK_NOTNULL(avformat_new_stream(encoder_fmt_ctx, nullptr));
+
+    // encoder
+    auto encoder = avcodec_find_encoder_by_name("libx264"); //libx264
+    CHECK_NOTNULL(encoder);
+
+    AVCodecContext *encoder_ctx = avcodec_alloc_context3(encoder);
+    CHECK_NOTNULL(encoder_ctx);
+    defer(avcodec_free_context(&encoder_ctx));
+
+    AVDictionary* encoder_options = nullptr;
+    av_dict_set(&encoder_options, "crf", "23", AV_DICT_DONT_OVERWRITE);
+    av_dict_set(&encoder_options, "threads", "auto", AV_DICT_DONT_OVERWRITE);
+    defer(av_dict_free(&encoder_options));
 
     // encoder codec params
-    int out_h = av_buffersink_get_h(sink_filter_ctx);
-    int out_w = av_buffersink_get_w(sink_filter_ctx);
-    const char* dec_pix_fmt = "rgb24";
-    AVPixelFormat dstFormat = av_get_pix_fmt(dec_pix_fmt);
+    encoder_ctx->height = av_buffersink_get_h(sink_filter_ctx);
+    encoder_ctx->width = av_buffersink_get_w(sink_filter_ctx);
+    encoder_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
 
-    SwsContext* sws_context = sws_getContext(
-            out_w, out_w, decoder_ctx->pix_fmt, // 输入格式
-            out_w, out_w, dstFormat,       // 输出格式
-            SWS_BILINEAR, nullptr, nullptr, nullptr);
-    CHECK_NOTNULL(sws_context);
+    encoder_ctx->sample_aspect_ratio = av_buffersink_get_sample_aspect_ratio(sink_filter_ctx);
+    encoder_ctx->framerate = av_buffersink_get_frame_rate(sink_filter_ctx);
 
+    // time base
+    encoder_ctx->time_base = av_inv_q(encoder_ctx->framerate);
+    encoder_fmt_ctx->streams[0]->time_base = av_buffersink_get_time_base(sink_filter_ctx);
+
+    if (encoder_fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER) {
+        encoder_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+
+    CHECK(avcodec_open2(encoder_ctx, encoder, &encoder_options) >= 0);
+    CHECK(avcodec_parameters_from_context(encoder_fmt_ctx->streams[0]->codecpar, encoder_ctx) >= 0);
+
+    if(!(encoder_fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
+        CHECK(avio_open(&encoder_fmt_ctx->pb, out_filename, AVIO_FLAG_WRITE) >= 0);
+    }
+
+    CHECK(avformat_write_header(encoder_fmt_ctx, nullptr) >= 0);
+
+    av_dump_format(encoder_fmt_ctx, 0, out_filename, 1);
+    std::cout << fmt::format("\n[OUTPUT] {:>3d}x{:>3d}, framerate = {}/{}, tbc = {}/{}, tbn = {}/{}",
+                             encoder_ctx->width, encoder_ctx->height,
+                             encoder_ctx->framerate.num, encoder_ctx->framerate.den,
+                             encoder_ctx->time_base.num, encoder_ctx->time_base.den,
+                             encoder_fmt_ctx->streams[0]->time_base.num, encoder_fmt_ctx->streams[0]->time_base.den);
 
     AVPacket * in_packet = av_packet_alloc();
     AVFrame * in_frame = av_frame_alloc();
     AVPacket* out_packet = av_packet_alloc();
     AVFrame * filtered_frame = av_frame_alloc();
-
-    AVFrame * rgb_frame = av_frame_alloc();
-    rgb_frame->height = out_h;
-    rgb_frame->width = out_w;
-    rgb_frame->format = dstFormat;
-    av_frame_get_buffer(rgb_frame, 0);
 
     while(av_read_frame(decoder_fmt_ctx, in_packet) >= 0 && decoder_ctx->frame_num < 200) {
         if (in_packet->stream_index != video_stream_idx) {
@@ -174,15 +202,28 @@ int main(int argc, char* argv[])
                 //
                 filtered_frame->pict_type = AV_PICTURE_TYPE_NONE;
 
-                // 将帧转换为 RGB 格式
-                sws_scale(sws_context, filtered_frame->data, filtered_frame->linesize,
-                          0, filtered_frame->height,
-                          rgb_frame->data, rgb_frame->linesize);
+                // encoding
+                ret = avcodec_send_frame(encoder_ctx, filtered_frame);
+                while(ret >= 0) {
+                    av_packet_unref(out_packet);
+                    ret = avcodec_receive_packet(encoder_ctx, out_packet);
+                    if(ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                        break;
+                    } else if(ret < 0) {
+                        fprintf(stderr, "encoder: avcodec_receive_packet()\n");
+                        return -1;
+                    }
 
-                // 打印 RGB 帧数据
-                std::cout << "Decoded RGB frame: " << codec_context->width << "x" << codec_context->height
-                          << ", Data size: " << rgb_buffer.size() << std::endl;
+                    out_packet->stream_index = 0;
+                    av_packet_rescale_ts(out_packet, decoder_fmt_ctx->streams[video_stream_idx]->time_base, encoder_fmt_ctx->streams[0]->time_base);
+                    std::cout << fmt::format("[ENCODING] frame = {:>4d}, pts = {:>6d}, dts = {:>6d}, size = {:>6d}",
+                                             decoder_ctx->frame_num, out_packet->pts, out_packet->dts, out_packet->size);
 
+                    if (av_interleaved_write_frame(encoder_fmt_ctx, out_packet) != 0) {
+                        std::cout << "encoder: av_interleaved_write_frame()";
+                        return -1;
+                    }
+                }
             }
         }
         av_packet_unref(in_packet);
@@ -192,6 +233,10 @@ int main(int argc, char* argv[])
     av_frame_free(&in_frame);
     av_packet_free(&out_packet);
     av_frame_free(&filtered_frame);
+
+    av_write_trailer(encoder_fmt_ctx);
+    if (encoder_fmt_ctx && !(encoder_fmt_ctx->oformat->flags & AVFMT_NOFILE))
+        avio_closep(&encoder_fmt_ctx->pb);
 
     return 0;
 }
