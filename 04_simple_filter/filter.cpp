@@ -7,19 +7,21 @@ extern "C" {
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
 #include <libavdevice/avdevice.h>
+#include <libavutil/pixdesc.h>
 }
-#include "logging.h"
+#include "something.h"
 #include "defer.h"
 #include "fmt/format.h"
 
 int main(int argc, char* argv[])
 {
-    Logger::init(argv[0]);
 
-    CHECK(argc >= 3) << "filter <input> <output>";
-
-    const char * in_filename = argv[1];
-    const char * out_filename = argv[2];
+//    CHECK(argc >= 3);
+//
+//    const char * in_filename = argv[1];
+//    const char * out_filename = argv[2];
+    const char * in_filename = "/Users/chenxinfeng/ml-project/ffmpegcv-cpp/examples/input.mp4";
+    const char * out_filename = "/Users/chenxinfeng/ml-project/ffmpegcv-cpp/examples/output_filter.mp4";
 
     AVFormatContext* decoder_fmt_ctx = nullptr;
     CHECK(avformat_open_input(&decoder_fmt_ctx, in_filename, nullptr, nullptr) >= 0);
@@ -47,7 +49,7 @@ int main(int argc, char* argv[])
     CHECK(avcodec_open2(decoder_ctx, decoder, &decoder_options) >= 0);
 
     av_dump_format(decoder_fmt_ctx, 0, in_filename, 0);
-    LOG(INFO) << fmt::format("[ INPUT] {:>3d}x{:>3d}, fps = {}/{}, tbr = {}/{}, tbc = {}/{}, tbn = {}/{}",
+    std::cout << fmt::format("[ INPUT] {:>3d}x{:>3d}, fps = {}/{}, tbr = {}/{}, tbc = {}/{}, tbn = {}/{}",
                              decoder_ctx->width, decoder_ctx->height,
                              decoder_fmt_ctx->streams[video_stream_idx]->avg_frame_rate.num, decoder_fmt_ctx->streams[video_stream_idx]->avg_frame_rate.den,
                              decoder_fmt_ctx->streams[video_stream_idx]->r_frame_rate.num, decoder_fmt_ctx->streams[video_stream_idx]->r_frame_rate.den,
@@ -65,37 +67,41 @@ int main(int argc, char* argv[])
     CHECK_NOTNULL(buffersink);
     const AVFilter *vflip_filter = avfilter_get_by_name("vflip");
     CHECK_NOTNULL(vflip_filter);
+    const AVFilter* scale_filter = avfilter_get_by_name("scale");
 
     AVStream* video_stream = decoder_fmt_ctx->streams[video_stream_idx];
     AVRational fr = av_guess_frame_rate(decoder_fmt_ctx, video_stream, nullptr);
     std::string args = fmt::format("video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect={}/{}:frame_rate={}/{}",
-                                   decoder_ctx->width, decoder_ctx->height, decoder_ctx->pix_fmt,
+                                   decoder_ctx->width, decoder_ctx->height, av_get_pix_fmt_name(decoder_ctx->pix_fmt),
                                    video_stream->time_base.num, video_stream->time_base.den,
                                    video_stream->codecpar->sample_aspect_ratio.num, std::max<int>(1, video_stream->codecpar->sample_aspect_ratio.den),
                                    fr.num, fr.den);
 
-    LOG(INFO) << "buffersrc args: " << args;
+    std::cout << "\nbuffersrc args: " << args << std::endl;
 
     AVFilterContext *src_filter_ctx = nullptr;
     AVFilterContext *sink_filter_ctx = nullptr;
     AVFilterContext *vflip_filter_ctx = nullptr;
+    AVFilterContext *scale_filter_ctx = nullptr;
 
     CHECK(avfilter_graph_create_filter(&src_filter_ctx, buffersrc, "src", args.c_str(), nullptr, filter_graph) >= 0);
     enum AVPixelFormat pix_fmts[] = { AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE };
     CHECK(avfilter_graph_create_filter(&sink_filter_ctx, buffersink, "sink", nullptr, nullptr, filter_graph) >= 0);
     CHECK(av_opt_set_int_list(sink_filter_ctx, "pix_fmts", pix_fmts, AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN) >= 0);
-    CHECK (avfilter_graph_create_filter(&vflip_filter_ctx, vflip_filter, "vflip", nullptr, nullptr, filter_graph) >= 0);
+    CHECK(avfilter_graph_create_filter(&vflip_filter_ctx, vflip_filter, "vflip", nullptr, nullptr, filter_graph) >= 0);
+    CHECK(avfilter_graph_create_filter(&scale_filter_ctx, scale_filter, "scale", "320:240", nullptr, filter_graph) >= 0);
 
     CHECK(avfilter_link(src_filter_ctx, 0, vflip_filter_ctx, 0) == 0);
-    CHECK(avfilter_link(vflip_filter_ctx, 0, sink_filter_ctx, 0) == 0);
+    CHECK(avfilter_link(vflip_filter_ctx, 0, scale_filter_ctx, 0) == 0);
+    CHECK(avfilter_link(scale_filter_ctx, 0, sink_filter_ctx, 0) == 0);
 
     CHECK(avfilter_graph_config(filter_graph, nullptr) >= 0);
     char * graph = avfilter_graph_dump(filter_graph, nullptr);
     CHECK_NOTNULL(graph);
-    LOG(INFO) << "filter graph >>>> \n" << graph;
+    std::cout << "\nfilter graph >>>> \n" << graph << std::endl;
     // @}
 
-    LOG(INFO) << fmt::format("[FILTER] {:>3d}x{:>3d}, framerate = {}/{}, timebase = {}/{}",
+    std::cout << fmt::format("[FILTER] {:>3d}x{:>3d}, framerate = {}/{}, timebase = {}/{}",
                              av_buffersink_get_w(sink_filter_ctx), av_buffersink_get_h(sink_filter_ctx),
                              av_buffersink_get_frame_rate(sink_filter_ctx).num, av_buffersink_get_frame_rate(sink_filter_ctx).den,
                              av_buffersink_get_time_base(sink_filter_ctx).num, av_buffersink_get_time_base(sink_filter_ctx).den);
@@ -110,7 +116,7 @@ int main(int argc, char* argv[])
     CHECK_NOTNULL(avformat_new_stream(encoder_fmt_ctx, nullptr));
 
     // encoder
-    auto encoder = avcodec_find_encoder_by_name("libx265");
+    auto encoder = avcodec_find_encoder_by_name("libx264"); //libx264
     CHECK_NOTNULL(encoder);
 
     AVCodecContext *encoder_ctx = avcodec_alloc_context3(encoder);
@@ -123,8 +129,8 @@ int main(int argc, char* argv[])
     defer(av_dict_free(&encoder_options));
 
     // encoder codec params
-    encoder_ctx->height = decoder_ctx->height;
-    encoder_ctx->width = decoder_ctx->width;
+    encoder_ctx->height = av_buffersink_get_h(sink_filter_ctx);
+    encoder_ctx->width = av_buffersink_get_w(sink_filter_ctx);
     encoder_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
 
     encoder_ctx->sample_aspect_ratio = av_buffersink_get_sample_aspect_ratio(sink_filter_ctx);
@@ -148,7 +154,7 @@ int main(int argc, char* argv[])
     CHECK(avformat_write_header(encoder_fmt_ctx, nullptr) >= 0);
 
     av_dump_format(encoder_fmt_ctx, 0, out_filename, 1);
-    LOG(INFO) << fmt::format("[OUTPUT] {:>3d}x{:>3d}, framerate = {}/{}, tbc = {}/{}, tbn = {}/{}",
+    std::cout << fmt::format("\n[OUTPUT] {:>3d}x{:>3d}, framerate = {}/{}, tbc = {}/{}, tbn = {}/{}",
                              encoder_ctx->width, encoder_ctx->height,
                              encoder_ctx->framerate.num, encoder_ctx->framerate.den,
                              encoder_ctx->time_base.num, encoder_ctx->time_base.den,
@@ -159,7 +165,7 @@ int main(int argc, char* argv[])
     AVPacket* out_packet = av_packet_alloc();
     AVFrame * filtered_frame = av_frame_alloc();
 
-    while(av_read_frame(decoder_fmt_ctx, in_packet) >= 0 && decoder_ctx->frame_number < 200) {
+    while(av_read_frame(decoder_fmt_ctx, in_packet) >= 0 && decoder_ctx->frame_num < 200) {
         if (in_packet->stream_index != video_stream_idx) {
             continue;
         }
@@ -210,11 +216,11 @@ int main(int argc, char* argv[])
 
                     out_packet->stream_index = 0;
                     av_packet_rescale_ts(out_packet, decoder_fmt_ctx->streams[video_stream_idx]->time_base, encoder_fmt_ctx->streams[0]->time_base);
-                    LOG(INFO) << fmt::format("[ENCODING] frame = {:>4d}, pts = {:>6d}, dts = {:>6d}, size = {:>6d}",
-                                             decoder_ctx->frame_number, out_packet->pts, out_packet->dts, out_packet->size);
+                    std::cout << fmt::format("[ENCODING] frame = {:>4d}, pts = {:>6d}, dts = {:>6d}, size = {:>6d}",
+                                             decoder_ctx->frame_num, out_packet->pts, out_packet->dts, out_packet->size);
 
                     if (av_interleaved_write_frame(encoder_fmt_ctx, out_packet) != 0) {
-                        LOG(ERROR) << "encoder: av_interleaved_write_frame()";
+                        std::cout << "encoder: av_interleaved_write_frame()";
                         return -1;
                     }
                 }
