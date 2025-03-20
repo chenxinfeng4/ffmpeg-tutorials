@@ -2,6 +2,7 @@
 #include <string>
 #include "something.h"
 #include "ffmpegcv.hpp"
+#include "filter_graph.h"
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -77,6 +78,9 @@ private:
     AVCodecContext* codecContext = nullptr;
     AVPacket* packet = nullptr;
     AVFrame* frame = nullptr;
+    AVFilterGraph* filterGraph = nullptr;
+    AVFilterContext* buffersrcCtx = nullptr;
+    AVFilterContext* buffersinkCtx = nullptr;
 
 public:
     int width = 0;
@@ -133,6 +137,11 @@ public:
         width = size_wh.width;
         height = size_wh.height;
 
+        // 创建 avfilter_graph
+        filterstr = "crop=600:400:16:32,scale=400x300";
+        filterGraph = avfilter_graph_alloc();
+
+
         // 计算每帧的位数
         outnumpyshape = get_outnumpyshape(size_wh, tgt_pix_fmt);
         bytes_per_frame = 1;
@@ -153,6 +162,62 @@ public:
 
         packet = av_packet_alloc();
         frame = av_frame_alloc();
+
+        // 初始化过滤链
+        init_filter_chain(filterstr.c_str());
+    }
+
+    void init_filter_chain(const char* filterstr) {
+        const AVFilter* buffersrc = avfilter_get_by_name("buffer");
+        const AVFilter* buffersink = avfilter_get_by_name("buffersink");
+        AVFilterInOut* inputs = avfilter_inout_alloc();
+        AVFilterInOut* outputs = avfilter_inout_alloc();
+        char args[512];
+
+        // 设置 buffer 源的参数
+        auto video_stream = decoderFmtCtx->streams[videoStreamIndex];
+        snprintf(args, sizeof(args),
+                 "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
+                 codecContext->width, codecContext->height, codecContext->pix_fmt,
+                 video_stream->time_base.num, video_stream->time_base.den,
+                 video_stream->sample_aspect_ratio.num, video_stream->sample_aspect_ratio.den);
+        std::cout << "filter = " << args << std::endl;
+        CHECK(avfilter_graph_create_filter(&buffersrcCtx, buffersrc, "in", args, nullptr, filterGraph) >= 0,
+              "Failed to create buffer source");
+
+        // 设置 buffer 汇的参数
+        CHECK(avfilter_graph_create_filter(&buffersinkCtx, buffersink, "out", nullptr, nullptr, filterGraph) >= 0,
+              "Failed to create buffer sink");
+
+        // 构建过滤链
+        outputs->name = av_strdup("in");
+        outputs->filter_ctx = buffersrcCtx;
+        outputs->pad_idx = 0;
+        outputs->next = nullptr;
+        inputs->name = av_strdup("out");
+        inputs->filter_ctx = buffersinkCtx;
+        inputs->pad_idx = 0;
+        inputs->next = nullptr;
+        CHECK(avfilter_graph_parse_ptr(filterGraph, filterstr, &inputs, &outputs, nullptr) >= 0,
+              "Failed to parse filter graph");
+
+        // 检查 inputs 和 outputs 是否正确设置
+        CHECK(inputs && inputs->filter_ctx, "Failed to find input filter");
+        CHECK(outputs && outputs->filter_ctx, "Failed to find output filter");
+
+        // 链接过滤链
+        CHECK(avfilter_link(buffersrcCtx, 0, inputs->filter_ctx, inputs->pad_idx) >= 0,
+              "Failed to link buffer source");
+
+        CHECK(avfilter_link(outputs->filter_ctx, outputs->pad_idx, buffersinkCtx, 0) >= 0,
+              "Failed to link buffer sink");
+
+        avfilter_inout_free(&inputs);
+        avfilter_inout_free(&outputs);
+
+        // 配置过滤链
+        CHECK(avfilter_graph_config(filterGraph, nullptr) >= 0,
+              "Failed to configure filter graph");
     }
 
     // 析构函数：释放资源
@@ -161,6 +226,7 @@ public:
         av_packet_free(&packet);
         avcodec_free_context(&codecContext);
         avformat_close_input(&decoderFmtCtx);
+        avfilter_graph_free(&filterGraph);
     }
 
     // 读取下一帧
@@ -198,7 +264,6 @@ public:
         AVFrame* avframe = nullptr;
         bool ret = read(avframe);
         if(!ret){return ret;}
-//        memcpy(framebuf, avframe->data[0], width*height);
         framebuf = avframe->data[0];
         return ret;
     }

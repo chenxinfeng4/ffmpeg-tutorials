@@ -23,6 +23,7 @@ set(CMAKE_CXX_STANDARD 14)
 
 add_executable(04_simple_filter
         filter.cpp
-        something.h)
+        something.h
+        filter_graph.h)
 
 target_link_libraries(04_simple_filter glog fmt avformat avcodec avutil swscale avfilter)
